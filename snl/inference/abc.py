@@ -7,7 +7,7 @@ import sys
 
 import numpy as np
 import scipy.special
-import snl.util as util
+from snl.util.math import discrete_sample
 
 
 def calc_dist(data_1, data_2):
@@ -59,7 +59,7 @@ class Rejection:
             if info:
                 dist.append(prop_dist)
 
-            logger.write(
+            logger.info(
                 "sim = {0}, accepted = {1}, dist = {2:.3}, acc rate = {3:.2%}\n".format(
                     n_sims, n_accepted, prop_dist, float(n_accepted) / n_sims
                 )
@@ -124,7 +124,7 @@ class MCMC:
 
             ps.append(self.cur_ps.copy())
 
-            logger.write(
+            logger.info(
                 "iter = {0}, dist = {1:.3}, acc rate = {2:.2%}\n".format(
                     i, cur_dist, float(n_accepted) / (i + 1)
                 )
@@ -152,13 +152,12 @@ class SMC:
     def run(
         self,
         obs_data,
-        eps_init,
-        eps_last,
+        n_initial_round,
         eps_decay,
         n_particles,
+        n_sims_budget,
         ess_min=0.5,
         logger=sys.stdout,
-        info=False,
         rng=np.random,
     ):
         """
@@ -179,34 +178,38 @@ class SMC:
 
         # sample initial population
         iter = 0
-        eps = eps_init
-        ps, n_sims = self.sample_initial_population(
-            obs_data, n_particles, eps, logger, rng
+        ps, n_sims, eps_init = self.sample_initial_population(
+            obs_data, n_particles, n_initial_round, logger, rng
         )
+        eps = eps_init
         log_weights = np.full(n_particles, -log_n_particles)
 
-        if info:
-            all_ps.append(ps)
-            all_log_weights.append(log_weights)
-            all_eps.append(eps)
-            all_log_ess.append(0.0)
-            all_n_sims.append(n_sims)
+        all_ps.append(ps)
+        all_log_weights.append(log_weights)
+        all_eps.append(eps)
+        all_log_ess.append(0.0)
+        all_n_sims.append(n_sims)
 
-        logger.write(
+        logger.info(
             "iter = {0}, eps = {1}, ess (%) = {2}, sims = {3}\n".format(
                 iter, eps, 1.0, n_sims
             )
         )
 
-        while eps > eps_last:
+        while n_sims < n_sims_budget:
 
             # sample next population
             iter += 1
             eps *= eps_decay
-            ps, log_weights, n_new_sims = self.sample_next_population(
-                ps, log_weights, obs_data, eps, logger, rng
-            )
-            n_sims += n_new_sims
+
+            try:
+                ps, log_weights, n_new_sims = self.sample_next_population(
+                    ps, log_weights, obs_data, eps, logger, rng
+                )
+                n_sims += n_new_sims
+            except SimulationBudgetExceeded:
+                logger.info("Simulation budget exceeded, quit simulation loop")
+                break
 
             # calculate effective sample size
             log_ess = -scipy.special.logsumexp(2.0 * log_weights) - log_n_particles
@@ -216,48 +219,68 @@ class SMC:
                 ps = self.resample_population(ps, log_weights, rng)
                 log_weights = np.full(n_particles, -log_n_particles)
 
-            if info:
-                all_ps.append(ps)
-                all_log_weights.append(log_weights)
-                all_eps.append(eps)
-                all_log_ess.append(log_ess)
-                all_n_sims.append(n_sims)
+            all_ps.append(ps)
+            all_log_weights.append(log_weights)
+            all_eps.append(eps)
+            all_log_ess.append(log_ess)
+            all_n_sims.append(n_sims)
 
-            logger.write(
+            logger.info(
                 "iter = {0}, eps = {1}, ess (%) = {2}, sims = {3}\n".format(
                     iter, eps, np.exp(log_ess), n_sims
                 )
             )
 
-        if info:
-            return all_ps, all_log_weights, all_eps, all_log_ess, all_n_sims
-        else:
-            return ps, log_weights
+            # terminate if simulation budget has been reached
+            if n_sims >= n_sims_budget:
+                logger.info("Reached simulation budget")
+                break
 
-    def sample_initial_population(self, obs_data, n_particles, eps, logger, rng):
+        return (
+            all_ps,
+            all_log_weights,
+            all_eps,
+            all_log_ess,
+            all_n_sims,
+        )
+
+    def sample_initial_population(
+        self, obs_data, n_particles, n_initial_round, logger, rng
+    ):
         """
-        Sample an initial population of n_particles, with tolerance eps.
+        Sample an initial population of n_particles out of n_initial_round
         """
 
         ps = []
+        ds = []
+
         n_sims = 0
 
-        for i in range(n_particles):
+        for i in range(n_initial_round):
 
             dist = float("inf")
             prop_ps = None
 
-            while dist > eps:
-                prop_ps = self.prior.gen(rng=rng)
-                data = self.sim_model(prop_ps, rng=rng)
-                dist = calc_dist(data, obs_data)
-                n_sims += 1
+            prop_ps = self.prior.gen(rng=rng)
+            data = self.sim_model(prop_ps, rng=rng)
+            dist = calc_dist(data, obs_data)
+            n_sims += 1
 
             ps.append(prop_ps)
+            ds.append(dist)
 
-            logger.write("particle {0}\n".format(i + 1))
+        if n_initial_round > n_particles:
+            quantile = n_particles / n_initial_round
 
-        return np.array(ps), n_sims
+            sortidx = np.argsort(np.array(ds))
+            n_quantile = int(quantile * n_initial_round)
+            eps_init = np.array(ds)[sortidx][n_quantile]
+
+            return np.array(ps)[sortidx][:n_quantile], n_sims, eps_init
+
+        else:
+            eps_init = np.max(np.array(ds))
+            return np.array(ps), n_sims, eps_init
 
     def sample_next_population(self, ps, log_weights, obs_data, eps, logger, rng):
         """
@@ -281,7 +304,7 @@ class SMC:
             dist = float("inf")
 
             while dist > eps:
-                idx = util.math.discrete_sample(weights, rng=rng)
+                idx = discrete_sample(weights, rng=rng)
                 new_ps[i] = ps[idx] + np.dot(std, rng.randn(n_dim))
                 data = self.sim_model(new_ps[i], rng=rng)
                 dist = calc_dist(data, obs_data)
@@ -296,7 +319,7 @@ class SMC:
                 new_ps[i], log=True
             ) - scipy.special.logsumexp(log_weights + log_kernel)
 
-            logger.write("particle {0}\n".format(i + 1))
+            # logger.info("particle {0}\n".format(i + 1))
 
         # normalize weights
         new_log_weights -= scipy.special.logsumexp(new_log_weights)
@@ -310,7 +333,7 @@ class SMC:
         """
 
         n_particles = ps.shape[0]
-        idx = util.math.discrete_sample(np.exp(log_weights), n_particles, rng=rng)
+        idx = discrete_sample(np.exp(log_weights), n_particles, rng=rng)
         ps = ps[idx]
 
         return ps
