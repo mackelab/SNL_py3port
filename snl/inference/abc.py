@@ -337,3 +337,7 @@ class SMC:
         ps = ps[idx]
 
         return ps
+
+
+class SimulationBudgetExceeded(Exception):
+    pass
